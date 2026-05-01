@@ -21,13 +21,13 @@ Author: magicpin AI Challenge Team
 # =============================================================================
 
 # Your bot's URL (where your bot is running)
-BOT_URL = "http://localhost:8080"
+BOT_URL = "https://bot-vgiw.onrender.com"
 
 # Choose your LLM provider: "openai", "anthropic", "gemini", "deepseek", "groq", "ollama", "openrouter"
 LLM_PROVIDER = "openrouter"
 
 # Your API key (paste your key here)
-LLM_API_KEY = "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"  # <-- PUT YOUR API KEY HERE
+LLM_API_KEY = "your_api_key"  # <-- PUT YOUR API KEY HERE
 
 # Model to use (leave empty for default, or specify like "gpt-4o", "claude-3-5-sonnet-20241022", etc.)
 LLM_MODEL = "openai/gpt-4o-mini"  # <-- Optional: specify model or leave empty for default

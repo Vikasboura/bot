@@ -27,7 +27,7 @@ HOSTILE_MERCHANTS = set()
 
 # Replace with your actual API Key
 client = AsyncOpenAI(
-    api_key = os.environ["OPENAI_API_KEY"],
+    api_key = "your_api_key_here",
     base_url="https://openrouter.ai/api/v1"
 )
 MODEL = "openai/gpt-4o-mini" # Use OpenRouter model name
