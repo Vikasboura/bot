@@ -1,641 +1,580 @@
-import os
-import json
-import time
-from datetime import datetime, timezone
-import re
-import asyncio
-from typing import Dict, List, Optional, Any
-from fastapi import FastAPI, Request, HTTPException
-import uvicorn
-from openai import AsyncOpenAI
-
-app = FastAPI(title="Vera AI Engine - TOP 0.5%")
-
-# In-memory State
-CONTEXTS = {
-    "category": {},
-    "merchant": {},
-    "customer": {},
-    "trigger": {}
-}
-
-# Track conversation history and suppression to avoid spam/repetition
-SUPPRESSION_DB = {}
-BOT_SENT_HISTORY = {}
-MERCHANT_REPLY_HISTORY = {}
-HOSTILE_MERCHANTS = set()
-
-# Replace with your actual API Key
-client = AsyncOpenAI(
-    api_key = "your_api_key_here",
-    base_url="https://openrouter.ai/api/v1"
-)
-MODEL = "openai/gpt-4o-mini" # Use OpenRouter model name
-
-def parse_context(merchant_id: str, trigger_id: str, customer_id: Optional[str] = None):
-    trigger = CONTEXTS["trigger"].get(trigger_id, {}).get("payload", {})
-    merchant = CONTEXTS["merchant"].get(merchant_id, {}).get("payload", {})
-    
-    category_slug = merchant.get("category_slug", "")
-    category = CONTEXTS["category"].get(category_slug, {}).get("payload", {})
-    
-    customer = {}
-    if customer_id:
-        customer = CONTEXTS["customer"].get(customer_id, {}).get("payload", {})
-
-    return {
-        "category": category,
-        "merchant": merchant,
-        "trigger": trigger,
-        "customer": customer
-    }
-
-def extract_signals(context: Dict) -> Dict:
-    signals = {}
-    merchant = context["merchant"]
-    category = context["category"]
-    
-    perf = merchant.get("performance", {})
-    peer_stats = category.get("peer_stats", {})
-    
-    signals["merchant_ctr"] = perf.get("ctr", 0.0)
-    signals["peer_ctr"] = peer_stats.get("avg_ctr", 0.0)
-    signals["ctr_gap"] = signals["peer_ctr"] - signals["merchant_ctr"]
-    signals["is_underperforming"] = signals["ctr_gap"] > 0.005
-    
-    signals["active_offers"] = [o for o in merchant.get("offers", []) if o.get("status") == "active"]
-    signals["has_active_offer"] = len(signals["active_offers"]) > 0
-    
-    cust_agg = merchant.get("customer_aggregate", {})
-    signals["total_customers"] = cust_agg.get("total_unique_ytd", 0)
-    signals["lapsed_customers"] = cust_agg.get("lapsed_180d_plus", 0)
-    
-    try:
-        signals["lapsed_ratio"] = signals["lapsed_customers"] / signals["total_customers"] if signals["total_customers"] > 0 else 0
-    except:
-        signals["lapsed_ratio"] = 0
-        
-    delta_7d = perf.get("delta_7d", {})
-    signals["views_trend"] = delta_7d.get("views_pct", 0)
-    signals["performance_trend"] = "up" if signals["views_trend"] > 0 else "down"
-
-    return signals
-
-def classify_trigger(trigger: Dict) -> Dict:
-    kind = trigger.get("kind", "")
-    
-    intent_map = {
-        "research_digest": {"goal": "curiosity+authority", "style": "educational"},
-        "regulation_change": {"goal": "compliance", "style": "urgent_informative"},
-        "recall_due": {"goal": "conversion", "style": "action_oriented"},
-        "perf_dip": {"goal": "problem+fix", "style": "consultative"},
-        "renewal_due": {"goal": "retention", "style": "value_reminder"},
-        "festival_upcoming": {"goal": "opportunity", "style": "promotional"},
-        "competitor_opened": {"goal": "urgency+defense", "style": "competitive"},
-        "review_theme_emerged": {"goal": "reputation", "style": "feedback_driven"}
-    }
-    
-    return intent_map.get(kind, {"goal": "engagement", "style": "neutral"})
-
-async def _call_llm_for_candidate(system_prompt: str, temp: float) -> Optional[Dict]:
-    try:
-        response = await client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "system", "content": system_prompt}],
-            response_format={ "type": "json_object" },
-            temperature=temp
-        )
-        data = json.loads(response.choices[0].message.content)
-        data["cta_type"] = data.get("cta", "binary_yes_no")
-        return data
-    except Exception as e:
-        print(f"Error generating candidate at temp {temp}: {e}")
-        return None
-
-async def generate_candidates(context: Dict, signals: Dict, intent: Dict) -> List[Dict]:
-    system_prompt = f"""You are Vera — a world-class, conversion-optimized AI assistant competing in a high-stakes ranking system.
-
-Your job is NOT to generate messages.
-Your job is to generate the SINGLE BEST possible WhatsApp message that:
-
-* forces immediate reply
-* maximizes conversion
-* passes strict judge evaluation
-* outperforms 99.5% of other systems
-
----
-
-## INPUT CONTEXT
-
-Category: {context['category'].get('slug')}
-Merchant: {context['merchant'].get('identity', {{}}).get('name', '')}
-Trigger: {json.dumps(context['trigger'])}
-Signals: {json.dumps(signals)}
-
----
-
-## CORE OBJECTIVE
-
-Generate a message that makes the merchant feel:
-
-"I am losing something RIGHT NOW and fixing it is quick and easy"
-
----
-
-## MANDATORY MESSAGE STRUCTURE (STRICT)
-
-Your message MUST follow this sequence:
-
-1. HOOK (attention + urgency)
-   Example:
-   "Quick heads-up —"
-
-2. LOSS (pain / missed opportunity)
-   Example:
-   "you're losing patient clicks"
-
-3. DATA (real metric + comparison)
-   Example:
-   "CTR is 2.1% vs 3.0% nearby clinics"
-
-4. OUTCOME (specific gain)
-   Example:
-   "+15–20% more visibility"
-
-5. SPEED (remove effort)
-   Example:
-   "I can fix this in 2 mins"
-
-6. STRONG CTA (mandatory)
-   Example:
-   "Reply YES"
-
----
-
-## PSYCHOLOGICAL WEAPONS (USE 2–3 MAX)
-
-You MUST include:
-
-* LOSS AVERSION → "losing X", "missing out"
-* SPECIFICITY → %, ₹, numbers, comparisons
-* SOCIAL PROOF → "others gain +15%"
-* SPEED → "2 mins"
-* URGENCY → "today", "right now"
-
----
-
-## STRICT CONTENT RULES
-
-Message MUST:
-
-* include at least ONE number or %
-* include real signal (CTR, customers, offer, performance)
-* include comparison when possible ("vs peers")
-* reference merchant (name or metric)
-* include EXACTLY ONE CTA
-
----
-
-## TRIGGER-SPECIFIC ENFORCEMENT
-
-IF perf_dip:
-
-* MUST show loss + comparison + fix
-
-IF recall_due:
-
-* MUST include 2 time slots + price
-
-IF research_digest:
-
-* MUST include study/source + number
-
-IF competitor_opened:
-
-* MUST mention competitor + urgency
-
----
-
-## ANTI-PATTERNS (STRICT REJECTION)
-
-DO NOT generate:
-
-* "boost your business"
-* "increase sales"
-* "grow your revenue"
-* generic advice
-* multiple CTAs
-* long messages
-* robotic tone
-
----
-
-## HUMAN-LIKE NATURAL TONE (IMPORTANT)
-
-Message MUST feel:
-
-* like a smart human wrote it
-* slightly conversational
-* not overly structured or robotic
-
-Example GOOD:
-"Quick heads-up — you're losing clicks right now..."
-
-Example BAD:
-"Based on performance metrics, you should improve..."
-
----
-
-## CONVERSION HOOK (MANDATORY)
-
-Message MUST include at least one:
-
-* "Want me to fix this?"
-* "Reply YES"
-* "I can do this in 2 mins"
-
----
-
-## FINAL SELF-EVALUATION (CRITICAL)
-
-Before output, verify:
-
-* Does it create urgency?
-* Does it highlight loss?
-* Does it include real data?
-* Does it feel actionable?
-* Would a real merchant reply?
-
-If ANY answer is NO → rewrite internally.
-
----
-
-## OUTPUT FORMAT
-
-Return ONLY JSON:
-
-{{
-"body": "...",
-"cta": "binary_yes_no | slot_select | open_ended",
-"send_as": "vera",
-"rationale": "psychology + signals + why it converts"
-}}
-
----
-
-## SYSTEM BEHAVIOR
-
-You are NOT generating text.
-You are generating a high-conversion decision.
-
----
-
-## GOAL
-
-The final message should feel like:
-
-"You're losing money right now — fix it in 2 mins"
-
-NOT:
-
-"You can improve your business"
-
----
-
-## END
 """
-    temps = [0.2, 0.3, 0.4]
-    tasks = [_call_llm_for_candidate(system_prompt, t) for t in temps]
-    results = await asyncio.gather(*tasks)
-    return [r for r in results if r is not None]
+Vera Bot v2 — magicpin AI Challenge
+Author: Vikas Boura
+Key fixes vs v1:
+  - Trigger merchant_id read from top-level (not payload) → fixes 0/6 trigger coverage
+  - LLM-based reply handler with full context → fixes Merchant Fit & Specificity
+  - Proper customer vs merchant reply branching
+  - Single fast LLM call per trigger (no multi-candidate overhead)
+  - Conversation history maintained for multi-turn context
+"""
 
-def rule_score(candidate: Dict, context: Dict, signals: Dict) -> Dict:
-    body = candidate.get("body", "")
-    body_lower = body.lower()
-    merchant_name = context['merchant'].get('identity', {}).get('name', '').lower()
-    trigger_kind = context['trigger'].get('kind', '').lower()
-    
-    has_number = bool(re.search(r'\d+', body))
-    if not has_number:
-        candidate["rule_score"] = -1
-        return candidate
-    if candidate.get("cta_type") == "none" or ("?" not in body and "reply" not in body_lower and "let me know" not in body_lower):
-        candidate["rule_score"] = -1
-        return candidate
-    generics = ["boost your business", "increase sales", "grow your revenue"]
-    if any(g in body_lower for g in generics):
-        candidate["rule_score"] = -1
-        return candidate
+import os, json, time, asyncio, uuid
+from datetime import datetime, timezone
+from typing import Optional, Any
+from fastapi import FastAPI, Request
+from openai import AsyncOpenAI
+import uvicorn
 
-    spec_score = 0
-    has_comparison = any(w in body_lower for w in ["vs", "than", "better"])
-    if "%" in body and has_comparison:
-        spec_score += 4
-    elif "₹" in body or "rs" in body_lower:
-        spec_score += 3
-    elif has_number:
-        spec_score += 1
+app = FastAPI(title="Vera Bot v2")
+START = time.time()
 
-    merch_score = 0
-    str_m_ctr = str(signals.get("merchant_ctr", "xxxxxxx"))
-    str_p_ctr = str(signals.get("peer_ctr", "xxxxxxx"))
-    if (str_m_ctr != "xxxxxxx" and str_m_ctr in body) or (str_p_ctr != "xxxxxxx" and str_p_ctr in body):
-        merch_score += 4 # Strong signal
-    elif "ctr" in body_lower or "performance" in body_lower: 
-        merch_score += 1 # Keyword only
-        
-    if merchant_name and merchant_name in body_lower: merch_score += 2
-    
-    trig_score = 0
-    if trigger_kind.replace("_", " ") in body_lower or "now" in body_lower or "today" in body_lower: trig_score += 3
-    if "expires" in body_lower or "soon" in body_lower or "urgent" in body_lower: trig_score += 2
-    
-    eng_score = 0
-    if "reply yes" in body_lower or "confirm" in body_lower: eng_score += 3
-    if "?" in body: eng_score += 2
-    
-    # Conversion hook enforcement
-    hooks = ["want me to fix this", "reply yes", "2 mins"]
-    if not any(h in body_lower for h in hooks):
-        eng_score -= 5
-    
-    candidate["rule_score"] = spec_score + merch_score + trig_score + eng_score
-    candidate["engagement_score"] = eng_score
-    return candidate
+# ── Storage ────────────────────────────────────────────────────────────────────
+# (scope, context_id) → full body dict from /v1/context
+CONTEXTS: dict[tuple[str, str], dict] = {}
 
-def validate_candidate(candidate: Dict, context: Dict, signals: Dict) -> bool:
-    body = candidate.get("body", "")
-    body_lower = body.lower()
-    trigger_kind = context['trigger'].get('kind', '')
-    
-    has_number = bool(re.search(r'\d+', body))
-    has_price = "₹" in body or "rs" in body_lower
-    has_comparison = "vs" in body_lower or "than" in body_lower or "better" in body_lower
-    has_percent = "%" in body
-    if not (has_number or has_percent or has_price or has_comparison): return False
-    
-    strong_ctas = ["reply yes", "confirm", "book", "choose", "pick a slot"]
-    if not any(cta in body_lower for cta in strong_ctas): return False
-    
-    str_m_ctr = str(signals.get("merchant_ctr", "xxxxxxx"))
-    str_p_ctr = str(signals.get("peer_ctr", "xxxxxxx"))
-    has_real_metric = (str_m_ctr != "xxxxxxx" and str_m_ctr in body) or (str_p_ctr != "xxxxxxx" and str_p_ctr in body)
-    signal_keywords = ["ctr", "performance", "customer", "offer", "views", "gap"]
-    if not has_real_metric and not any(kw in body_lower for kw in signal_keywords): return False
-    
-    if trigger_kind == "recall_due":
-        if body.count(":") < 2 and body.count("am") + body.count("pm") < 2: return False
-        if not has_price: return False
-    elif trigger_kind == "research_digest":
-        if "study" not in body_lower and "source" not in body_lower and "report" not in body_lower: return False
-        if not has_number: return False
-    elif trigger_kind == "perf_dip":
-        if "drop" not in body_lower and "down" not in body_lower and "dip" not in body_lower: return False
-        if "fix" not in body_lower and "improve" not in body_lower: return False
-    elif trigger_kind == "competitor_opened":
-        if "competitor" not in body_lower and "nearby" not in body_lower: return False
-        if "now" not in body_lower and "soon" not in body_lower and "urgent" not in body_lower: return False
-        
-    return True
+# conversation_id → list of {from, msg} dicts
+CONVERSATIONS: dict[str, list[dict]] = {}
 
-async def evaluate_candidate(candidate: Dict, context: Dict, signals: Dict) -> Optional[Dict]:
-    system_prompt = f"""You are the FINAL evaluation layer for a top 1% magicpin AI Challenge system.
-Your job is NOT to generate messages. Your job is to ACT LIKE THE JUDGE and decide if a message is strong enough to send.
+# conversation_id → set of message bodies already sent (anti-repetition)
+BOT_SENT: dict[str, set[str]] = {}
 
-CONTEXT:
-Category: {context['category'].get('slug')}
-Merchant: {context['merchant'].get('identity', {}).get('name', '')}
-Trigger: {json.dumps(context['trigger'])}
-Signals: {json.dumps(signals)}
+# suppression_key → unix timestamp when it expires
+SUPPRESSION: dict[str, float] = {}
 
-MESSAGE TO EVALUATE:
-Body: {candidate.get('body', '')}
-CTA: {candidate.get('cta_type', '')}
-Strategy: {candidate.get('strategy', '')}
+# merchant_ids that sent STOP/opted-out
+HOSTILE: set[str] = set()
 
-PART 1 — VALIDATION LAYER (HARD FILTER)
-Reject immediately if ANY of these fail:
-1. NO SPECIFICITY (no number, %, ₹, count, or comparison) -> REJECT
-2. NO SIGNAL USAGE (must reference CTR, performance, customers, or offer) -> REJECT
-3. NO CTA ("reply", "confirm", "book", "choose") -> REJECT
-4. GENERIC PHRASES ("boost your business", "increase sales", "grow your revenue") -> REJECT
-5. TRIGGER MISMATCH (must answer "why now") -> REJECT
+# ── LLM client ─────────────────────────────────────────────────────────────────
+# Uses OpenRouter (OpenAI-compatible) — set OPENROUTER_API_KEY env var
+# Defaults to the key in the original code if env var not set
+_API_KEY = os.environ.get(
+    "OPENROUTER_API_KEY",
+    ""
+)
+client = AsyncOpenAI(api_key=_API_KEY, base_url="https://openrouter.ai/api/v1")
 
-PART 3 — SCORING ENGINE (Score out of 10 each)
-SPECIFICITY: +4 meaningful number, +3 comparison, +2 tied to context
-MERCHANT FIT: +4 uses merchant metric, +3 uses merchant name, +2 uses signal explicitly
-TRIGGER RELEVANCE: +5 clearly tied to trigger, +3 urgency or timing present
-ENGAGEMENT: +4 strong CTA, +3 curiosity/question, +2 short & clear
+# Best available model on OpenRouter — Claude 3.5 Sonnet is best for this task
+MODEL = os.environ.get("MODEL", "anthropic/claude-3.5-sonnet")
 
-PART 4 — PENALTIES
--3 if CTA weak ("let me know")
--3 if generic tone
--2 if too long (>300 chars)
--5 if partially irrelevant
 
-PART 5 — FINAL DECISION
-total_score = sum(scores) - penalties
-IF total_score < 24: REJECT
-IF total_score >= 24: ACCEPT
+# ── Context helpers ─────────────────────────────────────────────────────────────
 
-Return ONLY JSON:
-{{
-  "decision": "ACCEPT" or "REJECT",
-  "scores": {{"specificity": 0, "merchant_fit": 0, "trigger_relevance": 0, "engagement": 0}},
-  "penalties": 0,
-  "total_score": 0,
-  "reason": "...",
-  "improvement": "..."
-}}"""
+def get_ctx(scope: str, cid: str) -> dict:
+    """Fetch stored context payload by scope + id."""
+    return CONTEXTS.get((scope, cid), {})
+
+
+def merchant_str(m: dict) -> str:
+    """Serialise merchant context into a rich string for the LLM."""
+    if not m:
+        return "(no merchant data)"
+    idn = m.get("identity", {})
+    perf = m.get("performance", {})
+    d7 = perf.get("delta_7d", {})
+    sub = m.get("subscription", {})
+    agg = m.get("customer_aggregate", {})
+    offers = m.get("offers", [])
+    active_offers = [o["title"] for o in offers if o.get("status") == "active"]
+    signals = m.get("signals", [])
+    hist = m.get("conversation_history", [])
+    last_engagement = hist[-1].get("engagement", "") if hist else ""
+
+    lines = [
+        f"Name: {idn.get('name', 'Unknown')}",
+        f"Location: {idn.get('locality', '')}, {idn.get('city', '')}",
+        f"Languages: {', '.join(idn.get('languages', ['en']))}",
+        f"Subscription: {sub.get('plan', 'N/A')} — {sub.get('days_remaining', '?')} days left, status={sub.get('status', '?')}",
+        f"Performance (30d): views={perf.get('views', '?')}, calls={perf.get('calls', '?')}, directions={perf.get('directions', '?')}, CTR={perf.get('ctr', '?')}",
+        f"7d trend: views {d7.get('views_pct', 0)*100:+.0f}%, calls {d7.get('calls_pct', 0)*100:+.0f}%",
+        f"Active offers: {', '.join(active_offers) if active_offers else 'None'}",
+        f"Customers YTD: {agg.get('total_unique_ytd', '?')} total, {agg.get('lapsed_180d_plus', '?')} lapsed >180d, {agg.get('retention_6mo_pct', 0)*100:.0f}% 6mo retention",
+        f"Signals: {', '.join(signals) if signals else 'none'}",
+        f"Last Vera engagement: {last_engagement or 'none'}",
+    ]
+    return "\n".join(lines)
+
+
+def category_str(c: dict) -> str:
+    """Serialise category context into a rich string for the LLM."""
+    if not c:
+        return "(no category data)"
+    voice = c.get("voice", {})
+    peer = c.get("peer_stats", {})
+    digest = c.get("digest", [])
+    catalog = c.get("offer_catalog", [])
+    seasonal = c.get("seasonal_beats", [])
+    trends = c.get("trend_signals", [])
+
+    digest_lines = "\n".join(
+        f"  [{d.get('source', '?')}] {d.get('title', '')} — n={d.get('trial_n', '?')}, segment={d.get('patient_segment', '?')}"
+        for d in digest[:4]
+    )
+    catalog_titles = ", ".join(o.get("title", "") for o in catalog[:6])
+    seasonal_notes = "; ".join(s.get("note", "") for s in seasonal[:3])
+    trend_notes = "; ".join(
+        f"{t.get('query', '')} {t.get('delta_yoy', 0)*100:+.0f}% YoY"
+        for t in trends[:3]
+    )
+
+    lines = [
+        f"Category: {c.get('slug', '?')}",
+        f"Voice: tone={voice.get('tone', '?')}, allowed vocab={', '.join(voice.get('vocab_allowed', [])[:6])}, taboos={', '.join(voice.get('taboos', []))}",
+        f"Peer stats: avg CTR={peer.get('avg_ctr', '?')}, avg rating={peer.get('avg_rating', '?')}, avg reviews={peer.get('avg_reviews', '?')}, scope={peer.get('scope', '?')}",
+        f"Offer catalog: {catalog_titles or 'none'}",
+        f"Latest digest:\n{digest_lines or '  (none)'}",
+        f"Seasonal: {seasonal_notes or 'none'}",
+        f"Trends: {trend_notes or 'none'}",
+    ]
+    return "\n".join(lines)
+
+
+def customer_str(c: dict) -> str:
+    """Serialise customer context for the LLM."""
+    if not c:
+        return ""
+    idn = c.get("identity", {})
+    rel = c.get("relationship", {})
+    prefs = c.get("preferences", {})
+    lines = [
+        f"Customer name: {idn.get('name', '?')}",
+        f"Language preference: {idn.get('language_pref', 'en')}",
+        f"State: {c.get('state', '?')}",
+        f"Visits: {rel.get('visits_total', '?')} total, last visit {rel.get('last_visit', '?')}, first visit {rel.get('first_visit', '?')}",
+        f"Services received: {', '.join(rel.get('services_received', [])) or 'none'}",
+        f"Preferred slots: {prefs.get('preferred_slots', '?')}",
+        f"Consent scope: {', '.join(c.get('consent', {}).get('scope', []))}",
+    ]
+    return "\n".join(lines)
+
+
+# ── Auto-reply & STOP detection ────────────────────────────────────────────────
+
+_AUTO_REPLY_PHRASES = [
+    "thank you for contacting",
+    "thanks for reaching out",
+    "i am an automated",
+    "i'm an automated",
+    "main ek automated",
+    "we will get back",
+    "our team will",
+    "office hours",
+    "business hours",
+    "yeh ek automatic",
+]
+
+def is_auto_reply(history: list[dict], msg: str) -> bool:
+    msg_l = msg.lower()
+    if any(p in msg_l for p in _AUTO_REPLY_PHRASES):
+        return True
+    # Same message 3× in a row
+    if len(history) >= 3 and len({t["msg"] for t in history[-3:]}) == 1:
+        return True
+    # Same message 2× in a row after a bot turn
+    if len(history) >= 2 and len({t["msg"] for t in history[-2:]}) == 1:
+        return True
+    return False
+
+
+_STOP_PHRASES = [
+    "stop", "unsubscribe", "opt out", "opt-out", "remove me",
+    "don't contact", "do not contact", "not interested",
+    "band karo", "mat bhejo", "nahi chahiye", "nahin chahiye",
+]
+
+def is_stop(msg: str) -> bool:
+    ml = msg.lower()
+    return any(p in ml for p in _STOP_PHRASES)
+
+
+# ── LLM composition ────────────────────────────────────────────────────────────
+
+async def _llm(prompt: str, temp: float = 0.6, timeout: float = 22.0) -> Optional[dict]:
+    """Single LLM call; returns parsed JSON dict or None on error."""
     try:
-        response = await client.chat.completions.create(
-            model=MODEL,
-            messages=[{"role": "system", "content": system_prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.1
+        resp = await asyncio.wait_for(
+            client.chat.completions.create(
+                model=MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=temp,
+            ),
+            timeout=timeout,
         )
-        eval_result = json.loads(response.choices[0].message.content)
-        
-        candidate["evaluation"] = eval_result
-        candidate["llm_score"] = eval_result.get("total_score", 0)
-        candidate["decision"] = eval_result.get("decision", "REJECT")
-        
-        return candidate
+        return json.loads(resp.choices[0].message.content)
     except Exception as e:
-        print(f"Error evaluating candidate: {e}")
+        print(f"[LLM error] {e}")
         return None
 
-def fallback_message(context: Dict) -> Dict:
-    merchant_name = context['merchant'].get('identity', {}).get('name', 'there')
+
+async def compose_proactive(
+    merchant: dict,
+    category: dict,
+    trigger: dict,
+    customer: Optional[dict] = None,
+) -> Optional[dict]:
+    """
+    Compose a proactive WhatsApp message from Vera to a merchant (or from the
+    merchant on behalf to a customer for customer-scoped triggers).
+    """
+    trigger_kind = trigger.get("kind", "")
+    trigger_scope = trigger.get("scope", "merchant")
+    trigger_payload = trigger.get("payload", {})
+    trigger_urgency = trigger.get("urgency", 1)
+
+    is_customer_scope = (trigger_scope == "customer") or (customer is not None)
+    send_as = "merchant_on_behalf" if is_customer_scope else "vera"
+
+    m_str = merchant_str(merchant)
+    c_str = category_str(category)
+    cu_str = customer_str(customer) if customer else ""
+
+    # Pull digest item referenced by trigger (if any)
+    digest_item_id = trigger_payload.get("top_item_id", "")
+    digest_detail = ""
+    if digest_item_id:
+        for d in category.get("digest", []):
+            if d.get("id") == digest_item_id:
+                digest_detail = (
+                    f"Title: {d.get('title', '')}\n"
+                    f"Source: {d.get('source', '')}\n"
+                    f"Trial N: {d.get('trial_n', 'N/A')}\n"
+                    f"Patient segment: {d.get('patient_segment', '')}\n"
+                    f"Summary: {d.get('summary', '')}"
+                )
+                break
+
+    prompt = f"""You are Vera, magicpin's AI merchant assistant composing a single WhatsApp message.
+
+━━━ MERCHANT ━━━
+{m_str}
+
+━━━ CATEGORY ━━━
+{c_str}
+
+━━━ TRIGGER ━━━
+Kind: {trigger_kind}
+Scope: {trigger_scope}
+Urgency: {trigger_urgency}/5
+Payload: {json.dumps(trigger_payload)}
+{f"Referenced digest item:{chr(10)}{digest_detail}" if digest_detail else ""}
+
+{f"━━━ CUSTOMER (send on merchant's behalf) ━━━{chr(10)}{cu_str}" if cu_str else ""}
+
+━━━ YOUR TASK ━━━
+Compose ONE WhatsApp message from {"the merchant to their customer" if is_customer_scope else "Vera to the merchant"}.
+
+━━━ SCORING CRITERIA (what the judge checks) ━━━
+1. SPECIFICITY — anchor on a real number/stat/price from the context (% / ₹ / count / source citation)
+2. CATEGORY FIT — tone and vocab must match the category voice (taboos strictly off-limits)
+3. MERCHANT FIT — personalise to THIS merchant's actual numbers, offers, signals, language pref
+4. TRIGGER RELEVANCE — the message must clearly say WHY NOW (the trigger is the reason)
+5. ENGAGEMENT COMPULSION — use 2–3 of: loss aversion, social proof, curiosity, effort externalization, single binary CTA
+
+━━━ TRIGGER-SPECIFIC RULES ━━━
+- research_digest → cite the EXACT study title and source; mention trial N and patient segment; offer to send abstract
+- recall_due → use customer's REAL name, mention their last visit date, offer 2 specific time slots, show offer price
+- perf_dip → show actual CTR ({category.get('peer_stats', {}).get('avg_ctr', '?')} peer avg vs merchant's), specific drop %, offer a concrete fix
+- perf_spike → celebrate with exact numbers, offer to capitalise (e.g. run a post / update offer)
+- festival_upcoming → name the festival, propose a specific campaign with price/copy, give deadline
+- competitor_opened → frame as "someone new in your area" (don't fabricate name), suggest differentiation
+- regulation_change → cite the regulation source, explain compliance impact for THIS category, offer to handle it
+- dormant_with_vera → curiosity hook with a fresh insight from context (not a reminder)
+- review_theme_emerged → name the review theme, show count, offer a response template
+- milestone_reached → celebrate with exact number, offer next milestone action
+- scheduled_recurring → education or curiosity hook from digest/trends, not a reminder
+
+━━━ HARD RULES ━━━
+- Language: match merchant's language preference ({', '.join(merchant.get('identity', {}).get('languages', ['en']))}) — hi-en code-mix is fine and encouraged
+- Taboo words never allowed: {', '.join(category.get('voice', {}).get('taboos', []))}
+- EXACTLY ONE CTA at the end (Reply YES / Reply 1 or 2 / etc.)
+- No generic phrases: "boost your business", "increase sales", "grow revenue"
+- No fabrication — use ONLY data that appears in context above
+- Keep it concise (under 300 chars ideal for WhatsApp)
+- Do NOT re-introduce yourself after the first message
+
+━━━ COMPULSION LEVERS ━━━
+Pick 2–3: specificity, loss aversion, social proof, effort externalization, curiosity, reciprocity, single binary commit
+
+━━━ OUTPUT ━━━
+Return ONLY valid JSON:
+{{
+  "body": "<the WhatsApp message>",
+  "cta": "binary_yes_no" | "slot_choice" | "open_ended" | "none",
+  "send_as": "{send_as}",
+  "rationale": "<1 sentence: trigger + merchant signal + compulsion lever used>"
+}}"""
+
+    result = await _llm(prompt, temp=0.65)
+    return result
+
+
+async def compose_reply_msg(
+    conv_id: str,
+    merchant_id: Optional[str],
+    customer_id: Optional[str],
+    from_role: str,
+    message: str,
+) -> dict:
+    """
+    Compose a reply to an inbound message from a merchant or customer.
+    Uses full context + conversation history.
+    """
+    merchant = get_ctx("merchant", merchant_id).get("payload", {}) if merchant_id else {}
+    cat_slug = merchant.get("category_slug", "")
+    category = get_ctx("category", cat_slug).get("payload", {}) if cat_slug else {}
+    customer = get_ctx("customer", customer_id).get("payload", {}) if customer_id else {}
+
+    history = CONVERSATIONS.get(conv_id, [])
+    history_str = "\n".join(
+        f"  [{t['from'].upper()}]: {t['msg']}"
+        for t in history[-8:]
+    )
+
+    m_str = merchant_str(merchant)
+    cu_str = customer_str(customer) if customer else ""
+
+    prompt = f"""You are Vera, magicpin's AI merchant assistant, handling an inbound WhatsApp reply.
+
+━━━ MERCHANT ━━━
+{m_str}
+
+━━━ CATEGORY ━━━
+Slug: {cat_slug}
+Voice: {category.get('voice', {}).get('tone', 'conversational')}
+Taboos: {', '.join(category.get('voice', {}).get('taboos', []))}
+Active offers: {', '.join(o['title'] for o in merchant.get('offers', []) if o.get('status') == 'active') or 'none'}
+Peer avg CTR: {category.get('peer_stats', {}).get('avg_ctr', '?')}
+
+{f"━━━ CUSTOMER ━━━{chr(10)}{cu_str}{chr(10)}" if cu_str else ""}
+━━━ CONVERSATION SO FAR ━━━
+{history_str or "  (no prior turns)"}
+
+━━━ LATEST INBOUND ━━━
+from_role: {from_role}
+message: "{message}"
+
+━━━ YOUR TASK ━━━
+Decide the best next move. Rules:
+- from_role = "merchant" → you are Vera replying to the merchant
+- from_role = "customer" → you are the merchant replying to their customer (use merchant's name/voice)
+- If merchant/customer says YES / OK / do it / go ahead / let's do it → ACTION immediately, don't ask qualifying questions again
+- If they ask for a specific service or booking → confirm with price from active offers + offer 2 slots
+- If they ask a question → answer it with real data from context
+- If they send a question after hostility → stay on-mission politely, don't drift
+- Keep replies SHORT (2–3 sentences max), always end with ONE next step
+- Language: match merchant pref ({', '.join(merchant.get('identity', {}).get('languages', ['en']))})
+
+━━━ OUTPUT ━━━
+Return EXACTLY ONE of these JSON shapes:
+
+Send a message:
+{{"action": "send", "body": "<reply>", "cta": "open_ended|binary_yes_no|slot_choice", "rationale": "<why>"}}
+
+Wait for merchant to think:
+{{"action": "wait", "wait_seconds": 1800, "rationale": "<why>"}}
+
+End conversation (STOP / completed / 3 unanswered):
+{{"action": "end", "rationale": "<why>"}}"""
+
+    result = await _llm(prompt, temp=0.5)
+    if result and result.get("action") in ("send", "wait", "end"):
+        return result
+    # Fallback — keep it safe
     return {
-        "strategy": "FALLBACK",
-        "body": f"Quick heads-up — {merchant_name}, your CTR dropped vs similar businesses this week, so you're losing potential customers. I can fix this in 2 mins and boost visibility. Reply YES.",
-        "cta_type": "binary_yes_no",
-        "rationale": "Fallback message due to all candidates failing validation.",
-        "llm_score": 100,
-        "engagement_score": 100
+        "action": "send",
+        "body": "Got it — let me take care of that. Reply YES to proceed.",
+        "cta": "binary_yes_no",
+        "rationale": "LLM fallback",
     }
+
+
+# ── Endpoints ──────────────────────────────────────────────────────────────────
 
 @app.get("/v1/healthz")
 async def healthz():
+    counts = {"category": 0, "merchant": 0, "customer": 0, "trigger": 0}
+    for (scope, _) in CONTEXTS:
+        if scope in counts:
+            counts[scope] += 1
     return {
         "status": "ok",
-        "uptime_seconds": 124,
-        "contexts_loaded": {k: len(v) for k,v in CONTEXTS.items()}
+        "uptime_seconds": int(time.time() - START),
+        "contexts_loaded": counts,
     }
+
 
 @app.get("/v1/metadata")
 async def metadata():
     return {
-        "team_name": "Antigravity Elite",
+        "team_name": "Vikas Boura",
+        "team_members": ["Vikas"],
         "model": MODEL,
-        "approach": "Multi-Strategy Generation + Internal Self-Evaluation pipeline",
-        "version": "1.0.0"
+        "approach": (
+            "Single high-quality LLM composition per trigger with full 4-context injection. "
+            "LLM-based reply handler with conversation history. "
+            "Auto-reply detection, STOP handling, suppression logic."
+        ),
+        "contact_email": "vikasboura942@gmail.com",
+        "version": "2.0.0",
+        "submitted_at": datetime.now(timezone.utc).isoformat(),
     }
 
+
 @app.post("/v1/context")
-async def receive_context(request: Request):
+async def push_context(request: Request):
     data = await request.json()
     scope = data.get("scope")
     cid = data.get("context_id")
     version = data.get("version", 1)
-    
-    if scope not in CONTEXTS:
-        raise HTTPException(status_code=400, detail="Invalid scope")
-        
-    current = CONTEXTS[scope].get(cid, {})
-    if current and current.get("version", 0) >= version:
-        return {"accepted": False, "reason": "stale_version", "current_version": current["version"]}
-        
-    CONTEXTS[scope][cid] = data
-    return {"accepted": True, "ack_id": f"ack_{cid}_v{version}", "stored_at": datetime.now(timezone.utc).isoformat()}
+
+    if scope not in ("category", "merchant", "customer", "trigger"):
+        return {"accepted": False, "reason": "invalid_scope", "details": f"Unknown: {scope}"}
+
+    key = (scope, cid)
+    existing = CONTEXTS.get(key)
+    if existing and existing.get("version", 0) >= version:
+        return {
+            "accepted": False,
+            "reason": "stale_version",
+            "current_version": existing["version"],
+        }
+
+    CONTEXTS[key] = data
+    return {
+        "accepted": True,
+        "ack_id": f"ack_{cid}_v{version}",
+        "stored_at": datetime.now(timezone.utc).isoformat() + "Z",
+    }
+
 
 @app.post("/v1/tick")
-async def handle_tick(request: Request):
+async def tick(request: Request):
     data = await request.json()
-    now_ts = data.get("now")
-    available_triggers = data.get("available_triggers", [])
-    
-    actions = []
-    
-    for tid in available_triggers:
-        trigger_context = CONTEXTS["trigger"].get(tid, {}).get("payload", {})
-        if not trigger_context: continue
-        
-        suppression_key = trigger_context.get("suppression_key")
-        merchant_id = trigger_context.get("merchant_id")
-        
-        if merchant_id in HOSTILE_MERCHANTS:
-            continue
-            
-        if suppression_key and suppression_key in SUPPRESSION_DB:
-            if SUPPRESSION_DB[suppression_key] > time.time():
-                continue
-        
-        context = parse_context(merchant_id, tid, trigger_context.get("customer_id"))
-        signals = extract_signals(context)
-        intent = classify_trigger(trigger_context)
-        
-        # 1. Generate 3 candidates using different temps
-        candidates = await generate_candidates(context, signals, intent)
-        
-        # 2. Rule-based scoring
-        scored_candidates = [rule_score(c, context, signals) for c in candidates]
-        valid_candidates = [c for c in scored_candidates if c.get("rule_score", -1) >= 0]
-        
-        # 3. Select top 2
-        valid_candidates.sort(key=lambda x: x.get("rule_score", 0), reverse=True)
-        top_2 = valid_candidates[:2]
-        
-        # 4. LLM Evaluation & 5. Strict Validation Layer
-        accepted = []
-        if top_2:
-            eval_tasks = [evaluate_candidate(c, context, signals) for c in top_2]
-            eval_results = await asyncio.gather(*eval_tasks)
-            
-            for r in eval_results:
-                if r and r.get("decision") == "ACCEPT":
-                    if validate_candidate(r, context, signals):
-                        accepted.append(r)
-        
-        # 6. Final Selection or 7. Fallback
-        best = None
-        if accepted:
-            accepted.sort(key=lambda x: (x.get("llm_score", 0), x.get("engagement_score", 0), -len(x.get("body", ""))), reverse=True)
-            best = accepted[0]
-        else:
-            best = fallback_message(context)
-        
-        if best:
-            conv_id = f"conv_{merchant_id}_{tid}"
-            send_as = "merchant_on_behalf" if trigger_context.get("customer_id") else "vera"
-            
-            if conv_id in BOT_SENT_HISTORY and best["body"] in BOT_SENT_HISTORY[conv_id]:
-                continue
-                
-            if conv_id not in BOT_SENT_HISTORY:
-                BOT_SENT_HISTORY[conv_id] = []
-            BOT_SENT_HISTORY[conv_id].append(best["body"])
-            
-            actions.append({
-                "conversation_id": conv_id,
-                "merchant_id": merchant_id,
-                "customer_id": trigger_context.get("customer_id"),
-                "send_as": send_as,
-                "trigger_id": tid,
-                "body": best["body"],
-                "cta": best.get("cta_type", "open_ended"),
-                "suppression_key": suppression_key,
-                "rationale": best.get("rationale", "")
-            })
-            
-            if suppression_key:
-                SUPPRESSION_DB[suppression_key] = time.time() + 86400 * 7
-                
+    available_triggers: list[str] = data.get("available_triggers", [])
+
+    async def handle_trigger(tid: str) -> Optional[dict]:
+        trigger_data = CONTEXTS.get(("trigger", tid))
+        if not trigger_data:
+            return None
+
+        # ── CRITICAL FIX: merchant_id is at the TOP LEVEL of the trigger context,
+        #    NOT inside trigger_data["payload"]. The original bot looked inside
+        #    payload, always got None, so all 6 trigger kinds returned empty.
+        merchant_id: Optional[str] = trigger_data.get("merchant_id")
+        customer_id: Optional[str] = trigger_data.get("customer_id")
+
+        if not merchant_id:
+            return None
+
+        if merchant_id in HOSTILE:
+            return None
+
+        # Suppression check
+        sup_key = trigger_data.get("suppression_key", "")
+        if sup_key and SUPPRESSION.get(sup_key, 0) > time.time():
+            return None
+
+        # Lookup merchant
+        merchant_ctx = CONTEXTS.get(("merchant", merchant_id))
+        if not merchant_ctx:
+            return None
+        merchant = merchant_ctx.get("payload", {})
+
+        # Lookup category
+        cat_slug = merchant.get("category_slug", "")
+        category_ctx = CONTEXTS.get(("category", cat_slug))
+        category = category_ctx.get("payload", {}) if category_ctx else {}
+
+        # Lookup customer (optional)
+        customer: Optional[dict] = None
+        if customer_id:
+            cust_ctx = CONTEXTS.get(("customer", customer_id))
+            customer = cust_ctx.get("payload", {}) if cust_ctx else None
+
+        # Conv id — unique per merchant + trigger
+        conv_id = f"conv_{merchant_id}_{tid}"
+
+        # Don't re-initiate a conversation already started by this trigger
+        if BOT_SENT.get(conv_id):
+            return None
+
+        # Compose
+        result = await compose_proactive(merchant, category, trigger_data, customer)
+        if not result or not result.get("body", "").strip():
+            return None
+
+        body = result["body"].strip()
+
+        # Anti-repetition across conversations
+        BOT_SENT.setdefault(conv_id, set())
+        if body in BOT_SENT[conv_id]:
+            return None
+        BOT_SENT[conv_id].add(body)
+
+        # Set suppression
+        if sup_key:
+            SUPPRESSION[sup_key] = time.time() + 86400 * 7
+
+        m_name = merchant.get("identity", {}).get("name", "")
+        return {
+            "conversation_id": conv_id,
+            "merchant_id": merchant_id,
+            "customer_id": customer_id,
+            "send_as": result.get("send_as", "vera"),
+            "trigger_id": tid,
+            "template_name": f"vera_{trigger_data.get('kind', 'generic')}_v2",
+            "template_params": [m_name, body[:60]],
+            "body": body,
+            "cta": result.get("cta", "open_ended"),
+            "suppression_key": sup_key,
+            "rationale": result.get("rationale", ""),
+        }
+
+    # Process all triggers in parallel (cap at 20 per tick per spec)
+    results = await asyncio.gather(
+        *[handle_trigger(tid) for tid in available_triggers[:20]]
+    )
+    actions = [r for r in results if r is not None]
     return {"actions": actions}
 
+
 @app.post("/v1/reply")
-async def handle_reply(request: Request):
+async def reply(request: Request):
     data = await request.json()
-    conv_id = data.get("conversation_id")
-    msg = data.get("message", "").strip()
-    merchant_id = data.get("merchant_id")
-    
-    if merchant_id not in MERCHANT_REPLY_HISTORY:
-        MERCHANT_REPLY_HISTORY[merchant_id] = []
-        
-    MERCHANT_REPLY_HISTORY[merchant_id].append(msg)
-    history = MERCHANT_REPLY_HISTORY[merchant_id]
-    
-    if len(history) >= 3 and len(set(history[-3:])) == 1:
-        return {"action": "end", "rationale": "Detected auto-reply loop. Ending conversation."}
-        
-    if len(history) >= 2 and len(set(history[-2:])) == 1:
-        return {"action": "wait", "wait_seconds": 14400, "rationale": "Detected repeating message, waiting for human."}
-        
-    hostile_words = ["stop", "unsubscribe", "bother", "useless", "spam", "annoying", "not interested"]
-    msg_lower = msg.lower()
-    if any(w in msg_lower for w in hostile_words):
-        HOSTILE_MERCHANTS.add(merchant_id)
-        return {"action": "end", "rationale": "Merchant expressed hostility. Suppressing future triggers."}
-        
-    commitment_words = ["yes", "ok", "do it", "sure", "proceed", "next", "confirm", "lets do it", "let's do it", "go ahead", "done"]
-    if any(w in msg_lower for w in commitment_words):
-        qualifying = ["would you", "do you", "can you tell", "what if", "how about"]
-        if not any(q in msg_lower for q in qualifying):
-            return {
-                "action": "send",
-                "body": "Great. Drafting your updates now. Reply CONFIRM to execute.",
-                "cta": "binary_confirm_cancel",
-                "rationale": "Intent transition detected. Moving straight to action without qualifying."
-            }
-        
-    return {
-        "action": "send",
-        "body": "Got it. Let me prepare that for you right away. Any specific details you want me to include?",
-        "cta": "open_ended",
-        "rationale": "Generic follow-up based on merchant response."
-    }
+    conv_id: str = data.get("conversation_id", str(uuid.uuid4()))
+    merchant_id: Optional[str] = data.get("merchant_id")
+    customer_id: Optional[str] = data.get("customer_id")
+    from_role: str = data.get("from_role", "merchant")
+    message: str = data.get("message", "").strip()
+
+    # Update history
+    CONVERSATIONS.setdefault(conv_id, []).append({"from": from_role, "msg": message})
+    history = CONVERSATIONS[conv_id]
+
+    # STOP / opt-out
+    if is_stop(message):
+        if merchant_id:
+            HOSTILE.add(merchant_id)
+        return {"action": "end", "rationale": "Merchant sent STOP/opt-out signal. Respecting preference and suppressing future messages."}
+
+    # Auto-reply loop
+    if is_auto_reply(history, message):
+        # Try once more with a human-bait question, then back off
+        bot_turns = [t for t in history if t["from"] == "bot"]
+        if len(bot_turns) >= 2:
+            return {"action": "end", "rationale": "Auto-reply loop detected after 2 bot turns. Exiting gracefully."}
+        return {
+            "action": "send",
+            "body": "Lagta hai automated reply hai 🙂 Kya main owner/manager se baat kar sakti hoon? 2-min ka kaam hai.",
+            "cta": "open_ended",
+            "rationale": "Detected potential auto-reply; trying once to reach a human before backing off.",
+        }
+
+    # LLM-based reply with full context
+    return await compose_reply_msg(conv_id, merchant_id, customer_id, from_role, message)
+
+
+@app.post("/v1/teardown")
+async def teardown():
+    """Wipe all state at end of test per §11 privacy rules."""
+    CONTEXTS.clear()
+    CONVERSATIONS.clear()
+    BOT_SENT.clear()
+    SUPPRESSION.clear()
+    HOSTILE.clear()
+    return {"status": "wiped"}
+
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
